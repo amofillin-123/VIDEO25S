@@ -150,11 +150,10 @@ class VideoEditor:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         # 使用MSER检测器
-        mser = cv2.MSER_create(
-            _min_area=100,
-            _max_area=2000,
-            _delta=5
-        )
+        mser = cv2.MSER_create()
+        mser.setMinArea(100)
+        mser.setMaxArea(2000)
+        mser.setDelta(5)
         
         # 检测区域
         regions, _ = mser.detectRegions(gray)

@@ -87,80 +87,41 @@ class VideoEditor:
             print(f"场景检测失败: {str(e)}")
             return None
 
-    def _select_scenes(self, scenes, total_duration):
-        """智能选择场景，优先选择有字幕的场景，同时保留开头和结尾"""
-        if not scenes or len(scenes) < 4:  # 至少需要4个场景
-            return scenes
+    def _select_scenes(self, scene_list):
+        """选择要使用的场景"""
+        if not scene_list:
+            return []
 
-        # 计算每个场景的时长并检测字幕
-        scene_info = []
-        print("\n检测场景字幕...")
-        for i, (start, end) in enumerate(scenes):
-            duration = end - start
-            print(f"\n分析场景 {i+1}/{len(scenes)} ({start:.1f}s - {end:.1f}s):")
-            subtitle_info = self._detect_scene_with_subtitle(start, end)
-            # 计算场景得分：有字幕得3分，无字幕得1分
-            score = 3 if subtitle_info['has_subtitle'] else 1
-            scene_info.append({
-                'duration': duration,
-                'start': start,
-                'end': end,
-                'score': score,
-                'has_subtitle': subtitle_info['has_subtitle'],
-                'subtitle_text': subtitle_info['text'] if subtitle_info['has_subtitle'] else None
-            })
+        # 按时间排序场景
+        sorted_scenes = sorted(scene_list, key=lambda x: x[0])
+        
+        # 选择场景
+        selected_scenes = []
+        total_duration = 0
+        target_duration = self.target_duration
+        
+        # 确保至少选择一个场景
+        if sorted_scenes:
+            first_scene = sorted_scenes[0]
+            duration = first_scene[1] - first_scene[0]
+            selected_scenes.append((first_scene[0], first_scene[1]))
+            total_duration += duration
+
+        # 随机选择其他场景
+        remaining_scenes = sorted_scenes[1:]
+        random.shuffle(remaining_scenes)
+        
+        for scene in remaining_scenes:
+            duration = scene[1] - scene[0]
+            if total_duration + duration <= target_duration:
+                selected_scenes.append((scene[0], scene[1]))
+                total_duration += duration
             
-            # 打印场景信息
-            status = "有字幕" if subtitle_info['has_subtitle'] else "无字幕"
-            if subtitle_info['has_subtitle']:
-                print(f"状态: {status}, 文本: {subtitle_info['text']}")
-            else:
-                print(f"状态: {status}")
-        
-        # 保留开头的两个场景
-        start_scenes = scene_info[:2]
-        for scene in start_scenes:
-            scene['score'] += 1  # 开头场景额外加1分
-        start_duration = sum(scene['duration'] for scene in start_scenes)
-        
-        # 保留结尾的两个场景
-        end_scenes = scene_info[-2:]
-        for scene in end_scenes:
-            scene['score'] += 1  # 结尾场景额外加1分
-        end_duration = sum(scene['duration'] for scene in end_scenes)
-        
-        # 中间场景
-        middle_scenes = scene_info[2:-2]
-        
-        # 计算中间部分需要的时长
-        target_middle_duration = self.target_duration - (start_duration + end_duration)
-        
-        if target_middle_duration <= 0:
-            # 如果开头和结尾已经超过目标时长，只保留它们的一部分
-            selected_scenes = [(scene['start'], scene['end']) for scene in (start_scenes + end_scenes)]
-            return selected_scenes[:int(self.target_duration)]
-        
-        # 按分数排序中间场景，分数相同时随机排序
-        middle_scenes.sort(key=lambda x: (x['score'], random.random()), reverse=True)
-        
-        # 选择中间场景
-        selected_middle_scenes = []
-        current_duration = 0
-        
-        for scene in middle_scenes:
-            if current_duration + scene['duration'] <= target_middle_duration:
-                selected_middle_scenes.append((scene['start'], scene['end']))
-                current_duration += scene['duration']
-                if current_duration >= target_middle_duration:
-                    break
-        
-        # 按时间顺序合并所有选中的场景
-        selected_scenes = (
-            [(scene['start'], scene['end']) for scene in start_scenes] +  # 开头场景
-            sorted(selected_middle_scenes) +                              # 中间场景（保持时间顺序）
-            [(scene['start'], scene['end']) for scene in end_scenes]     # 结尾场景
-        )
-        
+            if total_duration >= target_duration:
+                break
+
+        # 按时间顺序排序选中的场景
+        selected_scenes.sort()
         return selected_scenes
 
     def _extract_frame(self, time_point, output_path):
@@ -177,46 +138,42 @@ class VideoEditor:
 
     def detect_text_in_frame(self, frame):
         """
-        使用OpenCV检测帧中是否包含文字
+        使用OpenCV检测帧中是否包含文字（优化版本）
         """
+        # 缩小图像以加快处理
+        height, width = frame.shape[:2]
+        if width > 400:
+            scale = 400 / width
+            frame = cv2.resize(frame, None, fx=scale, fy=scale)
+            
         # 转换为灰度图
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # 应用自适应阈值
-        binary = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+        # 使用MSER检测器
+        mser = cv2.MSER_create(
+            _min_area=100,
+            _max_area=2000,
+            _delta=5
         )
         
-        # 查找轮廓
-        contours, _ = cv2.findContours(
-            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        # 检测区域
+        regions, _ = mser.detectRegions(gray)
         
-        # 分析轮廓以检测文本
-        text_like_contours = 0
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = float(w) / h
-            area = cv2.contourArea(contour)
+        # 如果检测到足够多的区域，认为存在文字
+        if len(regions) > 10:
+            return True
             
-            # 文本通常具有特定的宽高比和面积
-            if 0.1 < aspect_ratio < 15 and 50 < area < 10000:
-                text_like_contours += 1
-                
-            if text_like_contours > 5:  # 如果检测到足够多的可能文本区域
-                return True
-                
         return False
 
-    def has_text_in_video(self, video_path, sample_interval=1):
+    def has_text_in_video(self, video_path, sample_interval=3):
         """
-        检查视频中是否包含文字
+        检查视频中是否包含文字（优化版本）
         """
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         
-        # 每秒采样一帧
+        # 每3秒采样一帧
         for i in range(0, total_frames, fps * sample_interval):
             cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             ret, frame = cap.read()
@@ -303,10 +260,11 @@ class VideoEditor:
             new_width = width
             new_height = height
             
-        # 创建低分辨率版本
+        # 创建低分辨率版本，降低帧率以加快处理
         command = [
             "ffmpeg", "-i", self.input_path,
             "-vf", f"scale={new_width}:{new_height}",
+            "-r", "10",  # 降低帧率到10fps
             "-c:v", "libx264", "-crf", "28",  # 使用较高压缩率
             "-y", analysis_path
         ]
@@ -383,17 +341,21 @@ class VideoEditor:
         """创建最终视频的主方法"""
         try:
             # 1. 创建分析用的低分辨率版本
+            print("创建分析版本...")
             if not self._create_analysis_version():
                 print("创建分析版本失败")
                 return False
                 
             # 2. 在低分辨率版本上进行分析
-            scenes = detect(self.analysis_video_path, ContentDetector())
+            print("检测场景...")
+            scenes = detect(self.analysis_video_path, 
+                          ContentDetector(threshold=30.0, min_scene_len=15))  # 调整场景检测参数
             if not scenes:
                 print("场景检测失败")
                 return False
                 
             # 3. 处理场景信息
+            print("分析场景...")
             scene_list = []
             for scene in scenes:
                 start_time = scene[0].get_seconds()
@@ -408,12 +370,19 @@ class VideoEditor:
                     'subtitle_text': subtitle_info['text']
                 })
                 
-            # 4. 使用原始视频创建最终输出
-            selected_scenes = self._select_scenes(scene_list, self.target_duration)
-
+            # 4. 选择场景
+            print("选择场景...")
+            selected_scenes = self._select_scenes(scene_list)
+            if not selected_scenes:
+                print("场景选择失败")
+                return False
+                
             # 5. 使用原始高质量视频进行剪辑
+            print("创建最终视频...")
             success = self._create_video_from_scenes(selected_scenes)
             
+            if success:
+                print("处理完成！")
             return success
             
         except Exception as e:
@@ -487,7 +456,7 @@ class VideoEditor:
             if self.progress_callback:
                 self.progress_callback(40)  # 40% 进度
                 
-            selected_scenes = self._select_scenes(scenes, total_duration)
+            selected_scenes = self._select_scenes(scenes)
 
             # 提取选中的场景
             print("提取选中的场景...")

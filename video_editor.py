@@ -15,6 +15,9 @@ class VideoEditor:
         self.target_duration = target_duration
         self.temp_dir = tempfile.mkdtemp()
         self.progress_callback = None
+        self.analysis_video_path = None
+        self.max_analysis_width = 640  # 分析用的最大宽度
+        self.sample_interval = 2  # 采样间隔（秒）
 
     def _run_ffmpeg(self, command):
         """运行 ffmpeg 命令"""
@@ -280,6 +283,150 @@ class VideoEditor:
             'text': None
         }
 
+    def _create_analysis_version(self):
+        """创建用于分析的低分辨率版本"""
+        analysis_path = os.path.join(self.temp_dir, "analysis_version.mp4")
+        
+        # 获取原始视频信息
+        probe = self._get_video_info(self.input_path)
+        if not probe:
+            return None
+            
+        # 计算新的分辨率
+        width = int(probe.get('width', 1920))
+        height = int(probe.get('height', 1080))
+        if width > self.max_analysis_width:
+            scale_factor = self.max_analysis_width / width
+            new_width = self.max_analysis_width
+            new_height = int(height * scale_factor)
+        else:
+            new_width = width
+            new_height = height
+            
+        # 创建低分辨率版本
+        command = [
+            "ffmpeg", "-i", self.input_path,
+            "-vf", f"scale={new_width}:{new_height}",
+            "-c:v", "libx264", "-crf", "28",  # 使用较高压缩率
+            "-y", analysis_path
+        ]
+        
+        if self._run_ffmpeg(command):
+            self.analysis_video_path = analysis_path
+            return analysis_path
+        return None
+
+    def _get_video_info(self, video_path):
+        """获取视频信息"""
+        command = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            video_path
+        ]
+        
+        try:
+            result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                for stream in data.get('streams', []):
+                    if stream.get('codec_type') == 'video':
+                        return {
+                            'width': int(stream.get('width', 0)),
+                            'height': int(stream.get('height', 0)),
+                            'duration': float(stream.get('duration', 0))
+                        }
+        except Exception as e:
+            print(f"获取视频信息失败: {str(e)}")
+        return None
+
+    def _create_video_from_scenes(self, scenes):
+        """使用原始视频创建最终输出"""
+        video_segments = []
+        for i, (start, end) in enumerate(scenes):
+            segment_file = os.path.join(self.temp_dir, f"segment_{i}.mp4")
+            if self._extract_video_segment(start, end - start, segment_file):
+                video_segments.append(segment_file)
+                print(f"提取场景: {start:.1f}s - {end:.1f}s {'(开头)' if i < 2 else '(结尾)' if i >= len(scenes)-2 else '(中间)'}")
+
+        if not video_segments:
+            print("错误：无法提取有效场景")
+            return False
+
+        # 合并视频片段
+        print("合并场景...")
+        temp_video = os.path.join(self.temp_dir, "temp_video.mp4")
+        if not self._concat_videos(video_segments, temp_video):
+            print("错误：合并视频片段失败")
+            return False
+
+        # 添加音频（如果有）
+        print("添加音频...")
+        command = [
+            'ffmpeg', '-y',
+            '-i', temp_video,
+            '-i', self.input_path,
+            '-c:v', 'copy',  # 保持视频流不变
+            '-c:a', 'aac',
+            '-b:a', '320k',  # 使用最高音频比特率
+            '-shortest',  # 使用最短的流的长度
+            self.output_path
+        ]
+        if not self._run_ffmpeg(command):
+            print("错误：添加音频失败")
+            return False
+
+        return True
+
+    def create_final_video(self):
+        """创建最终视频的主方法"""
+        try:
+            # 1. 创建分析用的低分辨率版本
+            if not self._create_analysis_version():
+                print("创建分析版本失败")
+                return False
+                
+            # 2. 在低分辨率版本上进行分析
+            scenes = detect(self.analysis_video_path, ContentDetector())
+            if not scenes:
+                print("场景检测失败")
+                return False
+                
+            # 3. 处理场景信息
+            scene_list = []
+            for scene in scenes:
+                start_time = scene[0].get_seconds()
+                end_time = scene[1].get_seconds()
+                
+                # 使用低分辨率版本检测字幕
+                subtitle_info = self._detect_scene_with_subtitle(start_time, end_time)
+                scene_list.append({
+                    'start': start_time,
+                    'end': end_time,
+                    'has_subtitle': subtitle_info['has_subtitle'],
+                    'subtitle_text': subtitle_info['text']
+                })
+                
+            # 4. 使用原始视频创建最终输出
+            selected_scenes = self._select_scenes(scene_list, self.target_duration)
+
+            # 5. 使用原始高质量视频进行剪辑
+            success = self._create_video_from_scenes(selected_scenes)
+            
+            return success
+            
+        except Exception as e:
+            print(f"处理失败: {str(e)}")
+            return False
+            
+        finally:
+            # 清理临时文件
+            if self.analysis_video_path and os.path.exists(self.analysis_video_path):
+                os.remove(self.analysis_video_path)
+            if os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+
     def process_video(self, progress_callback=None):
         """处理视频的主要方法"""
         self.progress_callback = progress_callback
@@ -400,7 +547,3 @@ class VideoEditor:
             if os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir)
             return False
-
-    def create_final_video(self):
-        """为了保持兼容性的包装方法"""
-        return self.process_video()

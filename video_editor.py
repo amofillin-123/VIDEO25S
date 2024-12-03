@@ -6,9 +6,7 @@ import tempfile
 import numpy as np
 from scenedetect import detect, ContentDetector
 import shutil
-from Foundation import NSURL
-from Vision import VNRecognizeTextRequest, VNImageRequestHandler
-import Quartz
+import cv2
 
 class VideoEditor:
     def __init__(self, input_path, output_path, target_duration=25):
@@ -174,92 +172,60 @@ class VideoEditor:
         ]
         return self._run_ffmpeg(command)
 
-    def _check_subtitle(self, frame_path):
-        """检查图片中是否包含英文字幕"""
-        try:
-            # 创建图像处理请求，专门配置用于英文文本识别
-            request = VNRecognizeTextRequest.alloc().init()
-            # 设置识别参数
-            request.setRecognitionLevel_(1)  # 使用精确识别模式
-            request.setUsesLanguageCorrection_(True)  # 使用语言纠正
-            request.setMinimumTextHeight_(0.005)  # 最小文本高度为0.5%
+    def detect_text_in_frame(self, frame):
+        """
+        使用OpenCV检测帧中是否包含文字
+        """
+        # 转换为灰度图
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # 应用自适应阈值
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+        )
+        
+        # 查找轮廓
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        
+        # 分析轮廓以检测文本
+        text_like_contours = 0
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = float(w) / h
+            area = cv2.contourArea(contour)
             
-            # 读取图像
-            url = NSURL.fileURLWithPath_(frame_path)
-            source = Quartz.CGImageSourceCreateWithURL(url, None)
-            if source is None:
-                print("无法创建图像源")
-                return {'has_text': False, 'text': None}
+            # 文本通常具有特定的宽高比和面积
+            if 0.1 < aspect_ratio < 15 and 50 < area < 10000:
+                text_like_contours += 1
                 
-            # 获取第一帧图像
-            image = Quartz.CGImageSourceCreateImageAtIndex(source, 0, None)
-            if image is None:
-                print("无法获取图像")
-                return {'has_text': False, 'text': None}
+            if text_like_contours > 5:  # 如果检测到足够多的可能文本区域
+                return True
                 
-            handler = VNImageRequestHandler.alloc().initWithCGImage_options_(image, None)
-            
-            # 执行文字识别
-            error = None
-            success = handler.performRequests_error_([request], error)
-            if not success:
-                print(f"文字识别失败: {error}")
-                return {'has_text': False, 'text': None}
-                
-            # 获取识别结果
-            results = request.results()
-            if not results:
-                return {'has_text': False, 'text': None}
-            
-            detected_texts = []
-            # 分析识别到的文本
-            for result in results:
-                # 获取识别到的文本
-                text = result.text()
-                # 获取文本的置信度
-                confidence = result.confidence()
-                
-                # 检查是否是有效的文本
-                if self._is_valid_text(text) and confidence > 0.4:  # 提高置信度阈值到0.4
-                    # 获取文本框的位置信息
-                    boundingBox = result.boundingBox()
-                    # 文本框的高度（相对于图像高度）
-                    textHeight = boundingBox.size.height
-                    
-                    # 检查文本高度是否在合适的范围内
-                    if 0.005 <= textHeight <= 0.15:
-                        detected_texts.append(text)
-            
-            if detected_texts:
-                return {'has_text': True, 'text': ' '.join(detected_texts)}
-            return {'has_text': False, 'text': None}
-            
-        except Exception as e:
-            print(f"字幕检测失败: {str(e)}")
-            return {'has_text': False, 'text': None}
+        return False
 
-    def _is_valid_text(self, text):
-        """检查文本是否是有效的字幕文本"""
-        # 移除空白字符
-        text = text.strip()
-        if not text:
-            return False
-            
-        # 文本长度检查
-        if len(text) < 3:  # 增加到至少3个字符
-            return False
-            
-        # 检查是否包含有效字符（字母、数字、标点）
-        valid_chars = sum(1 for c in text if c.isalnum() or c in '.,!?\'"-:;()[]{}')
-        if valid_chars < 3:  # 增加到至少3个有效字符
-            return False
-            
-        # 检查特殊字符比例
-        special_chars = sum(1 for c in text if not c.isalnum() and c not in '.,!?\'"-:;()[]{}')
-        if special_chars / len(text) > 0.3:  # 特殊字符不应超过30%
-            return False
-            
-        return True
+    def has_text_in_video(self, video_path, sample_interval=1):
+        """
+        检查视频中是否包含文字
+        """
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        
+        # 每秒采样一帧
+        for i in range(0, total_frames, fps * sample_interval):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            if self.detect_text_in_frame(frame):
+                cap.release()
+                return True
+                
+        cap.release()
+        return False
 
     def _detect_scene_with_subtitle(self, start_time, end_time):
         """检测场景是否包含字幕，返回字幕信息"""
@@ -277,11 +243,11 @@ class VideoEditor:
         for time_point in check_points:
             frame_path = os.path.join(self.temp_dir, f"frame_{time_point}.jpg")
             if self._extract_frame(time_point, frame_path):
-                text_info = self._check_subtitle(frame_path)
-                if text_info['has_text']:
-                    current_text = text_info['text']
+                frame = cv2.imread(frame_path)
+                if self.detect_text_in_frame(frame):
+                    current_text = "Detected text"
                     # 如果当前文本与上一个有效文本相似度高，增加连续计数
-                    if last_valid_text is None or self._text_similarity(current_text, last_valid_text) > 0.6:
+                    if last_valid_text is None or current_text == last_valid_text:
                         consecutive_frames_with_text += 1
                         last_valid_text = current_text
                     else:
@@ -313,18 +279,6 @@ class VideoEditor:
             'has_subtitle': False,
             'text': None
         }
-
-    def _text_similarity(self, text1, text2):
-        """计算两个文本的相似度（简单实现）"""
-        # 将文本转换为小写并分割成单词
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-        
-        # 计算Jaccard相似度
-        intersection = len(words1.intersection(words2))
-        union = len(words1.union(words2))
-        
-        return intersection / union if union > 0 else 0
 
     def process_video(self, progress_callback=None):
         """处理视频的主要方法"""
